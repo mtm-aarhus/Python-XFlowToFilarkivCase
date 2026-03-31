@@ -20,7 +20,8 @@ dependencies = [
     "Pillow == 10.*",
     "requests",
     "pytz",
-    "pyodbc"
+    "pyodbc",
+    "python-magic-bin"
 ]
 
 [project.optional-dependencies]
