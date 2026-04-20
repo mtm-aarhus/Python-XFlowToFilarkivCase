@@ -112,6 +112,13 @@ def process(
         insert_xflow_address_if_missing(cursor, process_db_id, validated_address)
     conn.commit()
 
+    if not basic_data:
+        raise ValueError(
+            f"No basic data resolvable via DAWA for XflowId={process_public_id} "
+            f"(addresses tried: {[a for a in [address1, address2] if a]}). "
+            "Fix the address in Xflow and retry the queue element."
+        )
+
     # -------------------------------------------------------------------------
     # 6. Ensure FilArkiv case exists
     # -------------------------------------------------------------------------
@@ -140,6 +147,20 @@ def process(
             orchestrator_connection=orchestrator_connection,
             basic_data=basic_data,
         )
+
+    # -------------------------------------------------------------------------
+    # 6b. Sync any basic data that isn't in FilArkiv yet (replay path)
+    # -------------------------------------------------------------------------
+    append_missing_basic_data_to_filarkiv(
+        cursor=cursor,
+        conn=conn,
+        filarkiv_url=filarkiv_url,
+        access_token=access_token,
+        external_case_uuid=external_case_uuid,
+        local_case_row_id=local_case_row_id,
+        basic_data=basic_data,
+        orchestrator_connection=orchestrator_connection,
+    )
 
     # -------------------------------------------------------------------------
     # 7. Build document sources
@@ -895,6 +916,15 @@ def create_and_store_filarkiv_case(
         local_case_row_id,
         process_db_id,
     )
+
+    for entry in basic_data:
+        insert_basic_data_sync_row(
+            cursor=cursor,
+            case_row_id=local_case_row_id,
+            basic_data_type=entry["basicDataType"],
+            basic_data_id=entry["basicDataId"],
+        )
+
     conn.commit()
 
     orchestrator_connection.log_info(
@@ -902,6 +932,83 @@ def create_and_store_filarkiv_case(
     )
 
     return local_case_row_id, external_case_uuid
+
+
+def insert_basic_data_sync_row(
+    cursor,
+    case_row_id: int,
+    basic_data_type: int,
+    basic_data_id: str,
+) -> None:
+    cursor.execute(
+        """
+        INSERT INTO [FilArkiv].[BasicData]
+            ([AddedAt], [CaseId], [BasicDataType], [BasicDataId])
+        VALUES
+            (SYSUTCDATETIME(), ?, ?, ?)
+        """,
+        case_row_id,
+        basic_data_type,
+        basic_data_id,
+    )
+
+
+def append_missing_basic_data_to_filarkiv(
+    cursor,
+    conn,
+    filarkiv_url: str,
+    access_token: str,
+    external_case_uuid: str,
+    local_case_row_id: int,
+    basic_data: list[dict],
+    orchestrator_connection: OrchestratorConnection,
+) -> None:
+    added = 0
+
+    for entry in basic_data:
+        cursor.execute(
+            """
+            SELECT TOP 1 Id
+            FROM [FilArkiv].[BasicData]
+            WHERE CaseId = ?
+              AND BasicDataType = ?
+              AND BasicDataId = ?
+            """,
+            local_case_row_id,
+            entry["basicDataType"],
+            entry["basicDataId"],
+        )
+        if cursor.fetchone() is not None:
+            continue
+
+        response = requests.post(
+            f"{filarkiv_url}/BasicData",
+            headers={
+                "Authorization": f"Bearer {access_token}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "caseId": external_case_uuid,
+                "basicDataType": entry["basicDataType"],
+                "basicDataId": entry["basicDataId"],
+            },
+            timeout=60,
+        )
+        response.raise_for_status()
+
+        insert_basic_data_sync_row(
+            cursor=cursor,
+            case_row_id=local_case_row_id,
+            basic_data_type=entry["basicDataType"],
+            basic_data_id=entry["basicDataId"],
+        )
+        added += 1
+
+    if added:
+        conn.commit()
+        orchestrator_connection.log_info(
+            f"Appended {added} basic data entries to FilArkiv case {external_case_uuid}"
+        )
 
 def create_filarkiv_document(
     filarkiv_url: str,
