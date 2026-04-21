@@ -23,9 +23,11 @@ def main():
     orchestrator_connection.log_trace("Robot Framework started.")
     initialize.initialize(orchestrator_connection)
 
+
     queue_element = None
     error_count = 0
     task_count = 0
+
     # Retry loop
     for _ in range(config.MAX_RETRY_COUNT):
         try:
@@ -41,7 +43,18 @@ def main():
                     break  # Break queue loop
 
                 try:
-                    process.process(orchestrator_connection, queue_element)
+                    for attempt in range(1, config.QUEUE_ATTEMPTS + 1):
+                        try:
+                            process.process(orchestrator_connection, queue_element)
+                            break
+                        except Exception as e:
+                            orchestrator_connection.log_info(f"Attempt {attempt} failed: {e}")
+                            if attempt < config.QUEUE_ATTEMPTS:
+                                orchestrator_connection.log_info("Retrying queue element")
+                                reset.reset(orchestrator_connection)
+                            else:
+                                raise
+
                     orchestrator_connection.set_queue_element_status(queue_element.id, QueueStatus.DONE)
 
                 except BusinessError as error:
@@ -54,6 +67,7 @@ def main():
         except Exception as error:
             error_count += 1
             handle_error(f"Process Error #{error_count}", error, queue_element, orchestrator_connection)
+
 
     reset.clean_up(orchestrator_connection)
     reset.close_all(orchestrator_connection)
