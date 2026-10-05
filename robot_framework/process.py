@@ -43,9 +43,7 @@ def process(
     cursor = conn.cursor()
 
     xflow_api_url, xflow_token = get_xflow_access(orchestrator_connection)
-    dataforsyningen_url = (
-        orchestrator_connection.get_constant("DataforsyningenURL").value.rstrip("/")
-    )
+    address_services = get_address_services(orchestrator_connection)
 
     # -------------------------------------------------------------------------
     # 1. Ensure Xflow.Processes exists and load linked FilArkiv case info if any
@@ -105,7 +103,7 @@ def process(
     # -------------------------------------------------------------------------
     basic_data, validated_addresses = build_basic_data(
         [address1, address2],
-        dataforsyningen_url,
+        address_services,
     )
 
     for validated_address in validated_addresses:
@@ -114,7 +112,7 @@ def process(
 
     if not basic_data:
         raise ValueError(
-            f"No basic data resolvable via DAWA for XflowId={process_public_id} "
+            f"No basic data resolvable via Adressevask/Adressevælger for XflowId={process_public_id} "
             f"(addresses tried: {[a for a in [address1, address2] if a]}). "
             "Fix the address in Xflow and retry the queue element."
         )
@@ -610,7 +608,149 @@ def extract_filename_from_headers(headers: dict) -> str | None:
 # Address / basic data helpers
 # =============================================================================
 
-def build_basic_data(addresses: list[str], dataforsyningen_url: str) -> tuple[list[dict], list[str]]:
+# DAWA (api.dataforsyningen.dk) is closed (410 Gone). Addresses are now resolved via
+# Klimadatastyrelsens Adressevask/Adressevælger, and matrikel/BFE via Datafordeleren.
+# https://confluence.kds.dk/pages/viewpage.action?pageId=234782998
+AARHUS_KOMMUNEKODE = "0751"
+SAFE_ID_RE = re.compile(r"^[0-9A-Za-z-]+$")
+
+
+def get_address_services(orchestrator_connection: OrchestratorConnection) -> dict:
+    # Credentials hold URL (username) + token/API key (password).
+    adressevaelger = orchestrator_connection.get_credential("Adressevælger")
+    datafordeler = orchestrator_connection.get_credential("DatafordelerAPI")
+    return {
+        "adressevaelger_url": adressevaelger.username.rstrip("/"),
+        "adressevaelger_token": adressevaelger.password,
+        "datafordeler_url": datafordeler.username.rstrip("/"),
+        "datafordeler_api_key": datafordeler.password,
+    }
+
+
+def adressevaelger_get(address_services: dict, path: str, params: dict) -> dict:
+    response = requests.get(
+        f"{address_services['adressevaelger_url']}{path}",
+        params={**params, "token": address_services["adressevaelger_token"]},
+        timeout=60,
+    )
+    response.raise_for_status()
+    return response.json() or {}
+
+
+def resolve_husnummer(raw_address: str, address_services: dict) -> dict | None:
+    """Wash a free-text address into a DAR husnummer in Aarhus Kommune.
+
+    Adressevask only answers when exactly one address matches, so fall back to the
+    Adressevælger search (restricted to Aarhus) for looser input like "Vejnavn 9".
+    """
+    vask = adressevaelger_get(address_services, "/vask/", {"adresse": raw_address})
+    adresse_id = (vask.get("vaskeresultat") or {}).get("adresse_id_lokalid")
+    if adresse_id:
+        adresse = adressevaelger_get(address_services, f"/adresser/{adresse_id}", {}).get("adresse") or {}
+        husnummer = adresse.get("husnummer") or {}
+        if (husnummer.get("navngivenvejkommunedel") or {}).get("kommune") == AARHUS_KOMMUNEKODE:
+            return husnummer
+
+    search = adressevaelger_get(
+        address_services,
+        "/husnumre/soeg",
+        {"tekst": raw_address, "kommunekode": AARHUS_KOMMUNEKODE, "maksimum": 1},
+    )
+    hit = next(
+        (f for f in search.get("fund") or [] if f.get("type") in ("husnummer", "adresse") and f.get("id")),
+        None,
+    )
+    if hit is None:
+        return None
+
+    if hit["type"] == "adresse":
+        adresse = adressevaelger_get(address_services, f"/adresser/{hit['id']}", {}).get("adresse") or {}
+        return adresse.get("husnummer") or None
+    return adressevaelger_get(address_services, f"/husnumre/{hit['id']}", {}).get("husnummer") or None
+
+
+def datafordeler_query(address_services: dict, query: str) -> dict:
+    response = requests.post(
+        address_services["datafordeler_url"],
+        params={"apiKey": address_services["datafordeler_api_key"]},
+        json={"query": query},
+        headers={"Content-Type": "application/json"},
+        timeout=60,
+    )
+    if not response.ok:
+        # Don't let raise_for_status() put the apiKey (in the URL) into the OO log.
+        raise RuntimeError(f"Datafordeler GraphQL HTTP {response.status_code}: {response.text[:500]}")
+    payload = response.json() or {}
+    if payload.get("errors"):
+        raise RuntimeError(f"Datafordeler GraphQL error: {payload['errors'][0].get('message')}")
+    return payload.get("data") or {}
+
+
+def datafordeler_nodes(address_services: dict, entity: str, local_id: str, fields: str) -> list[dict]:
+    if not SAFE_ID_RE.match(local_id):
+        raise ValueError(f"Unexpected {entity} id: {local_id!r}")
+
+    ts = datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+    query = f"""
+    query {{
+      {entity}(
+        registreringstid: "{ts}"
+        virkningstid: "{ts}"
+        first: 10
+        where: {{ id_lokalId: {{ eq: "{local_id}" }} }}
+      ) {{
+        nodes {{ {fields} }}
+      }}
+    }}
+    """
+    return (datafordeler_query(address_services, query).get(entity) or {}).get("nodes") or []
+
+
+def lookup_jordstykke(husnummer_id: str, address_services: dict) -> dict | None:
+    """Replaces DAWA /jordstykker/reverse: husnummer -> jordstykke -> ejerlav + BFE.
+
+    DAWA found the jordstykke by point-in-polygon on the adgangspunkt; DAR registers
+    that same jordstykke on the husnummer, so we follow the relation instead.
+    Field names follow KDS' "Udvalgte REST-tjenester omsat til GraphQL-queries".
+    """
+    husnumre = datafordeler_nodes(address_services, "DAR_Husnummer", husnummer_id, "id_lokalId jordstykke")
+    jordstykke_id = next((str(h["jordstykke"]) for h in husnumre if h.get("jordstykke")), None)
+    if not jordstykke_id:
+        return None
+
+    jordstykker = datafordeler_nodes(
+        address_services,
+        "MAT_Jordstykke",
+        jordstykke_id,
+        "id_lokalId matrikelnummer ejerlavLokalId samletFastEjendomLokalId status",
+    )
+    if not jordstykker:
+        return None
+    jordstykke = next(
+        (j for j in jordstykker if str(j.get("status") or "").lower() == "gældende"),
+        jordstykker[0],
+    )
+
+    ejerlavskode = None
+    ejerlav_id = str(jordstykke.get("ejerlavLokalId") or "")
+    if ejerlav_id:
+        ejerlav = datafordeler_nodes(address_services, "MAT_Ejerlav", ejerlav_id, "id_lokalId ejerlavskode")
+        ejerlavskode = next((e["ejerlavskode"] for e in ejerlav if e.get("ejerlavskode") is not None), None)
+
+    bfenummer = None
+    sfe_id = str(jordstykke.get("samletFastEjendomLokalId") or "")
+    if sfe_id:
+        sfe = datafordeler_nodes(address_services, "MAT_SamletFastEjendom", sfe_id, "id_lokalId BFEnummer")
+        bfenummer = next((s["BFEnummer"] for s in sfe if s.get("BFEnummer") is not None), None)
+
+    return {
+        "ejerlavskode": ejerlavskode,
+        "matrikelnummer": jordstykke.get("matrikelnummer"),
+        "bfenummer": bfenummer,
+    }
+
+
+def build_basic_data(addresses: list[str], address_services: dict) -> tuple[list[dict], list[str]]:
     basic_data = []
     validated_addresses = []
     seen_basic = set()
@@ -637,55 +777,31 @@ def build_basic_data(addresses: list[str], dataforsyningen_url: str) -> tuple[li
         if not raw_address:
             continue
 
-        response = requests.get(
-            f"{dataforsyningen_url}/adresser",
-            params={
-                "kommunekode": "751",
-                "struktur": "mini",
-                "q": raw_address,
-            },
-            timeout=60,
-        )
-        response.raise_for_status()
-        matches = response.json() or []
-
-        if not matches:
+        husnummer = resolve_husnummer(raw_address, address_services)
+        if not husnummer:
             continue
 
-        addr = matches[0]
+        # DAR husnummer id == the old DAWA adgangsadresseid, so existing basic data still matches.
+        adresse_id = str(husnummer.get("id_lokalid") or "").strip()
+        postnummer = husnummer.get("postnummer") or {}
+        vejnavn = str(husnummer.get("vejnavn") or "").strip()
+        husnr = str(husnummer.get("husnummertekst") or "").strip()
+        postnr = str(postnummer.get("postnr") or "").strip()
+        postnrnavn = str(postnummer.get("navn") or "").strip()
 
-        adresse_id = str(addr.get("adgangsadresseid") or "").strip()
-        vejnavn = str(addr.get("vejnavn") or "").strip()
-        husnr = str(addr.get("husnr") or "").strip()
-        postnr = str(addr.get("postnr") or "").strip()
-        postnrnavn = str(addr.get("postnrnavn") or "").strip()
-        x = addr.get("x")
-        y = addr.get("y")
-
+        # Same format as the DAWA era so replays don't add duplicate Xflow.Addresses rows.
         validated_address = f"{vejnavn} {husnr}, {postnr} {postnrnavn}".strip(" ,")
         if validated_address and validated_address not in validated_addresses:
             validated_addresses.append(validated_address)
 
-        if adresse_id:
-            add_basic_data(1, adresse_id)
-
-        if x is None or y is None:
+        if not adresse_id:
             continue
+        add_basic_data(1, adresse_id)
 
-        response = requests.get(
-            f"{dataforsyningen_url}/jordstykker/reverse",
-            params={
-                "x": str(x).replace(",", "."),
-                "y": str(y).replace(",", "."),
-            },
-            timeout=60,
-        )
-        response.raise_for_status()
-        landlot = response.json() or {}
+        landlot = lookup_jordstykke(adresse_id, address_services) or {}
 
-        owner_low = landlot.get("ejerlav") or {}
-        owner_code = owner_low.get("kode")
-        cadastral_number = landlot.get("matrikelnr")
+        owner_code = landlot.get("ejerlavskode")
+        cadastral_number = landlot.get("matrikelnummer")
         bfe_number = landlot.get("bfenummer")
 
         if owner_code is not None and cadastral_number:
